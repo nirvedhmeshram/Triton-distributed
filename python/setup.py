@@ -488,6 +488,14 @@ class CMakeExtension(Extension):
 
 
 def build_rocshmem():
+    # If ROCSHMEM_HOME points to an existing install (pyrocshmem already built),
+    # skip the full from-source build.  The bitcode is expected to have been
+    # copied to triton_dist/tools/compile/ separately.
+    rocshmem_home = os.environ.get("ROCSHMEM_HOME", "")
+    if rocshmem_home and os.path.exists(os.path.join(rocshmem_home, "lib", "librocshmem.a")):
+        print(f"ROCSHMEM_HOME={rocshmem_home} already contains a built install — skipping rocshmem rebuild.")
+        return
+
     rocshmem_bind_dir = os.path.join(get_base_dir(), "shmem", "rocshmem_bind")
     rocshmem_dir = os.path.join(get_base_dir(), "3rdparty", "rocshmem")
     if not os.path.exists(rocshmem_dir) or len(os.listdir(rocshmem_dir)) == 0:
@@ -496,7 +504,7 @@ def build_rocshmem():
     if not os.path.exists(rocshmem_bind_dir):
         raise RuntimeError("ROCSHMEM bind source directory not found")
 
-    ROCM_ARCH = "gfx942"  # hard-code for now
+    ROCM_ARCH = os.environ.get("BITCODE_LIB_ARCH", "gfx942")
     extra_args = ["--arch", ROCM_ARCH] if ROCM_ARCH != "" else []
     subprocess.check_call(["bash", f"{rocshmem_bind_dir}/build.sh"] + extra_args)
 

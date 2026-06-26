@@ -97,7 +97,21 @@ def hip_deps():
 
 @pathlib_wrapper
 def mpi_deps():
-    mpi_home = Path("/opt/ompi_build/install/ompi/")
+    # Prefer OMPI_INSTALL_DIR env var, then the triton-dist default build
+    # location, then fall back to system OpenMPI (e.g. libopenmpi-dev).
+    ompi_default = Path("/opt/ompi_build/install/ompi")
+    system_ompi = Path("/usr/lib/x86_64-linux-gnu/openmpi")
+    ompi_env = os.environ.get("OMPI_INSTALL_DIR")
+    if ompi_env:
+        mpi_home = Path(ompi_env)
+    elif ompi_default.exists():
+        mpi_home = ompi_default
+    elif system_ompi.exists():
+        mpi_home = system_ompi
+    else:
+        raise RuntimeError(
+            "Cannot find OpenMPI. Set OMPI_INSTALL_DIR or install libopenmpi-dev."
+        )
     include_dirs = [mpi_home / "include"]
     library_dirs = [mpi_home / "lib"]
     libraries = ["mpi"]
