@@ -22,6 +22,7 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
+import os
 import torch
 import dataclasses
 from typing import List
@@ -200,6 +201,98 @@ def consumer_all_reduce_kernel(symm_buf_ptr, tile_signal_ptr, M, N, stride_cm, s
                 tl.store(remote_buf_ptrs, c, mask=c_mask)
 
 
+@triton_dist.jit
+def consumer_all_reduce_twoshot_kernel(symm_buf_ptr, tile_signal_ptr, M, N, stride_cm, stride_cn,
+                                       GEMM_BLOCK_M: tl.constexpr, GEMM_BLOCK_N: tl.constexpr,
+                                       GROUP_SIZE_M: tl.constexpr, COMM_BLOCK_M: tl.constexpr,
+                                       COMM_BLOCK_N: tl.constexpr, NUM_COMM_SMS: tl.constexpr,
+                                       WORLD_SIZE: tl.constexpr):
+    """Optimized tile-owned two-shot all-reduce consumer.
+
+    Keeps the tile-ownership + per-tile signal-wait contract of
+    ``consumer_all_reduce_kernel`` (so it stays compatible with the GEMM's
+    per-GEMM-tile signalling and the producer/consumer overlap) but decouples
+    the *communication* tile size from the GEMM tile size, and ports a few
+    techniques from the standalone two-shot fused all-reduce:
+
+      * **Decoupled comm tiling.** The GEMM tile (e.g. 256x256 with an fp32
+        accumulator) is far too large for a memory-bound reduction: it burns
+        ~256 KB of VGPRs per workgroup (≈1 wave) and, with only ``tiles/ws``
+        owned tiles, leaves most CUs idle. This kernel re-tiles ``(M, N)`` into
+        small ``COMM_BLOCK_M x COMM_BLOCK_N`` comm tiles (many more workgroups,
+        tiny accumulator → high occupancy) and maps each comm tile back to its
+        parent GEMM tile (the comm block must divide the GEMM block) via the
+        inverse of ``_compute_pid`` to recover the owner and signal slot.
+      * ``WORLD_SIZE`` is ``tl.constexpr`` so the peer loops unroll and skip-self
+        is a compile-time branch.
+      * The broadcast loop rotates the peer order by ``rank`` (stagger writes,
+        no rank-0 hotspot); the owner's own copy is written once with a
+        write-through cache modifier and skipped in the peer push loop.
+    """
+    rank = dl.rank()
+    pid = tl.program_id(0)
+
+    num_comm_m = tl.cdiv(M, COMM_BLOCK_M)
+    num_comm_n = tl.cdiv(N, COMM_BLOCK_N)
+    total_comm_tiles = num_comm_m * num_comm_n
+
+    # GEMM tiling, needed to recover the per-GEMM-tile signal slot.
+    num_gemm_m = tl.cdiv(M, GEMM_BLOCK_M)
+    num_gemm_n = tl.cdiv(N, GEMM_BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_gemm_n
+
+    for comm_tile in range(pid, total_comm_tiles, NUM_COMM_SMS):
+        comm_pid_m = comm_tile // num_comm_n
+        comm_pid_n = comm_tile % num_comm_n
+        row0 = comm_pid_m * COMM_BLOCK_M
+        col0 = comm_pid_n * COMM_BLOCK_N
+
+        # Parent GEMM tile (comm tile lies fully inside one GEMM tile because
+        # COMM_BLOCK divides GEMM_BLOCK and offsets are aligned).
+        gemm_pid_m = row0 // GEMM_BLOCK_M
+        gemm_pid_n = col0 // GEMM_BLOCK_N
+
+        # Inverse of _compute_pid: (gemm_pid_m, gemm_pid_n) -> gemm_tile_id.
+        group_id = gemm_pid_m // GROUP_SIZE_M
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_gemm_m - first_pid_m, GROUP_SIZE_M)
+        local_m = gemm_pid_m - first_pid_m
+        gemm_tile_id = group_id * num_pid_in_group + gemm_pid_n * group_size_m + local_m
+
+        owner_rank = gemm_tile_id % WORLD_SIZE
+        if rank == owner_rank:
+            signal_base = gemm_tile_id * WORLD_SIZE
+            offs_cm = row0 + tl.arange(0, COMM_BLOCK_M)
+            offs_cn = col0 + tl.arange(0, COMM_BLOCK_N)
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tile_offsets = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+
+            # Reduce: pull this comm tile from every peer (rotating the start
+            # peer by rank to stagger receive-side reads) and sum in fp32.
+            final_acc = tl.zeros((COMM_BLOCK_M, COMM_BLOCK_N), dtype=tl.float32)
+            for i in tl.static_range(WORLD_SIZE):
+                target_rank = (i + rank) % WORLD_SIZE
+                remote_c_ptr = dl.symm_at(symm_buf_ptr, target_rank)
+                token = dl.wait(tile_signal_ptr + signal_base + target_rank, 1, "sys", "acquire", waitValue=1)
+                remote_c_ptr = dl.consume_token(remote_c_ptr, token)
+                remote_c_ptrs = remote_c_ptr + tile_offsets
+                remote_data = tl.load(remote_c_ptrs, mask=c_mask, other=0.0)
+                final_acc += remote_data
+
+            c = final_acc.to(symm_buf_ptr.dtype.element_ty)
+
+            # Scatter: write our own copy through (write-through) and push the
+            # reduced tile to every other peer, rotating the peer order.
+            local_buf_ptrs = symm_buf_ptr + tile_offsets
+            tl.store(local_buf_ptrs, c, mask=c_mask, cache_modifier=".wt")
+            for i in tl.static_range(WORLD_SIZE):
+                target_rank = (i + rank + 1) % WORLD_SIZE
+                if target_rank != rank:
+                    remote_buf_ptr = dl.symm_at(symm_buf_ptr, target_rank)
+                    remote_buf_ptrs = remote_buf_ptr + tile_offsets
+                    tl.store(remote_buf_ptrs, c, mask=c_mask)
+
+
 DEFAULT_GEMM_CONFIG = triton.Config(
     kwargs={"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 4, "waves_per_eu": 2},
     num_warps=8, num_stages=2)
@@ -304,7 +397,13 @@ def prune_fn_by_shared_memory(config, ctx: GemmARContext, A: torch.Tensor, *args
     prune_fn=prune_fn_by_shared_memory,
 )
 def gemm_allreduce_op(ctx: GemmARContext, A: torch.Tensor, B: torch.Tensor, gemm_config: triton.Config):
-    NUM_COMM_SMS = 32
+    # Consumer selection / tuning knobs (default to the legacy behavior so the
+    # existing path is unchanged unless explicitly opted in). The optimized
+    # "twoshot" consumer uses a larger default comm-SM count since it re-tiles
+    # the reduction into many small comm tiles.
+    CONSUMER = os.environ.get("GEMM_AR_CONSUMER", "legacy")
+    _default_comm_sms = "128" if CONSUMER == "twoshot" else "32"
+    NUM_COMM_SMS = int(os.environ.get("GEMM_AR_COMM_SMS", _default_comm_sms))
     assert A.shape[1] == B.shape[1], "Incompatible dimensions"
     assert A.dtype == B.dtype, "Incompatible dtypes"
 
@@ -326,8 +425,18 @@ def gemm_allreduce_op(ctx: GemmARContext, A: torch.Tensor, B: torch.Tensor, gemm
                                                        B.stride(0), B.stride(1), symm_c.stride(0), symm_c.stride(1),
                                                        NUM_GEMM_SMS=NUM_GEMM_SMS, **gemm_config.all_kwargs())
     with torch.cuda.stream(ar_stream):
-        consumer_all_reduce(symm_c, tile_signal, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
-                            GROUP_SIZE_M=GROUP_SIZE_M, NUM_COMM_SMS=NUM_COMM_SMS)
+        if CONSUMER == "twoshot":
+            # Comm tile defaults to 256x128 (best on MI350X); clamped to the
+            # GEMM block so it always lies within one GEMM tile.
+            COMM_BLOCK_M = min(int(os.environ.get("GEMM_AR_COMM_BM", "256")), BLOCK_SIZE_M)
+            COMM_BLOCK_N = min(int(os.environ.get("GEMM_AR_COMM_BN", "128")), BLOCK_SIZE_N)
+            consumer_all_reduce_twoshot(symm_c, tile_signal, ctx.num_ranks, GEMM_BLOCK_M=BLOCK_SIZE_M,
+                                        GEMM_BLOCK_N=BLOCK_SIZE_N, GROUP_SIZE_M=GROUP_SIZE_M,
+                                        COMM_BLOCK_M=COMM_BLOCK_M, COMM_BLOCK_N=COMM_BLOCK_N,
+                                        NUM_COMM_SMS=NUM_COMM_SMS)
+        else:
+            consumer_all_reduce(symm_c, tile_signal, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                GROUP_SIZE_M=GROUP_SIZE_M, NUM_COMM_SMS=NUM_COMM_SMS)
     current_stream.wait_stream(ar_stream)
     reset_signal_and_barrier_all_kernel[(num_sms, )](ctx.rank, ctx.num_ranks, ctx.comm_buf_ptr, tile_signal,
                                                      tile_signal.shape[0], num_warps=16)
@@ -339,3 +448,18 @@ def consumer_all_reduce(symm_buf, tile_signal, BLOCK_SIZE_M=16, BLOCK_SIZE_N=64,
     consumer_all_reduce_kernel[(NUM_COMM_SMS, )](symm_buf, tile_signal, M, N, symm_buf.stride(0), symm_buf.stride(1),
                                                  BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N,
                                                  GROUP_SIZE_M=GROUP_SIZE_M, NUM_COMM_SMS=NUM_COMM_SMS, num_warps=16)
+
+
+def consumer_all_reduce_twoshot(symm_buf, tile_signal, world_size, GEMM_BLOCK_M, GEMM_BLOCK_N, GROUP_SIZE_M,
+                                COMM_BLOCK_M=64, COMM_BLOCK_N=64, NUM_COMM_SMS=128, num_warps=4):
+    M, N = symm_buf.shape
+    # The comm tile must lie within a single GEMM tile so its parent signal slot
+    # is well defined.
+    assert GEMM_BLOCK_M % COMM_BLOCK_M == 0, "COMM_BLOCK_M must divide GEMM_BLOCK_M"
+    assert GEMM_BLOCK_N % COMM_BLOCK_N == 0, "COMM_BLOCK_N must divide GEMM_BLOCK_N"
+    consumer_all_reduce_twoshot_kernel[(NUM_COMM_SMS, )](symm_buf, tile_signal, M, N, symm_buf.stride(0),
+                                                         symm_buf.stride(1), GEMM_BLOCK_M=GEMM_BLOCK_M,
+                                                         GEMM_BLOCK_N=GEMM_BLOCK_N, GROUP_SIZE_M=GROUP_SIZE_M,
+                                                         COMM_BLOCK_M=COMM_BLOCK_M, COMM_BLOCK_N=COMM_BLOCK_N,
+                                                         NUM_COMM_SMS=NUM_COMM_SMS, WORLD_SIZE=world_size,
+                                                         num_warps=num_warps)
