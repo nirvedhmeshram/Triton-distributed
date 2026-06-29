@@ -200,6 +200,135 @@ def consumer_all_reduce_kernel(symm_buf_ptr, tile_signal_ptr, M, N, stride_cm, s
                 tl.store(remote_buf_ptrs, c, mask=c_mask)
 
 
+@triton_dist.jit
+def gemm_allreduce_fused_twoshot_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,  # symmetric (M, N): GEMM partials in, all-reduced result out
+    tile_signal_ptr,  # symmetric tile completion signals
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    COMM_BLOCK_M: tl.constexpr,
+    COMM_BLOCK_N: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    """Fully fused GEMM + two-shot all-reduce in a single persistent kernel.
+
+    Two phases inside one launch on all CUs:
+
+      * **Phase 1 (GEMM):** every program computes its GEMM partials over the
+        GEMM tiles (grid-stride), stores them to symmetric ``c_ptr`` and signals
+        peers per tile. All CUs participate, so the GEMM is not SM-starved.
+      * **Phase 2 (reduce + broadcast):** the work is re-tiled into small
+        ``COMM_BLOCK`` comm tiles for high occupancy. Each comm tile is mapped
+        back to its parent GEMM tile (inverse ``_compute_pid``) to find the
+        owner and signal slot; the owner waits on the peers' signals, sums the
+        tile in fp32, and writes the result back into every rank's ``c_ptr``.
+
+    Unlike the two-kernel design there is no SM partition and no cross-stream
+    wait imbalance: by phase 2 the GEMM is already published, so the reduce is
+    bandwidth-bound rather than spinning on a slow producer. Result is written
+    in place into ``c_ptr`` (safe: a tile's partials are read only by that
+    tile's owner, so overwriting them with the result races with no one). A
+    trailing ``reset_signal_and_barrier_all`` makes the broadcast visible.
+    """
+    rank = dl.rank()
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tiles = num_pid_m * num_pid_n
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    # Phase 1: GEMM every tile, publish partial, signal peers.
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS):
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+            accumulator = tl.dot(a, b, accumulator)
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+        c = accumulator.to(c_ptr.dtype.element_ty)
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :], c, mask=c_mask)
+        signal_offset = tile_id * WORLD_SIZE + rank
+        for remote in tl.static_range(WORLD_SIZE):
+            remote_signal_ptr = dl.symm_at(tile_signal_ptr, remote)
+            st(remote_signal_ptr + signal_offset, 1, semantic="release", scope="system")
+
+    # Phase 2: decoupled small-tile two-shot reduce + broadcast for owned tiles.
+    num_comm_m = tl.cdiv(M, COMM_BLOCK_M)
+    num_comm_n = tl.cdiv(N, COMM_BLOCK_N)
+    total_comm_tiles = num_comm_m * num_comm_n
+    for comm_tile in tl.range(start_pid, total_comm_tiles, NUM_SMS):
+        comm_pid_m = comm_tile // num_comm_n
+        comm_pid_n = comm_tile % num_comm_n
+        row0 = comm_pid_m * COMM_BLOCK_M
+        col0 = comm_pid_n * COMM_BLOCK_N
+
+        gemm_pid_m = row0 // BLOCK_SIZE_M
+        gemm_pid_n = col0 // BLOCK_SIZE_N
+        group_id = gemm_pid_m // GROUP_SIZE_M
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        local_m = gemm_pid_m - first_pid_m
+        gemm_tile_id = group_id * num_pid_in_group + gemm_pid_n * group_size_m + local_m
+
+        owner_rank = gemm_tile_id % WORLD_SIZE
+        if rank == owner_rank:
+            signal_base = gemm_tile_id * WORLD_SIZE
+            offs_cm = row0 + tl.arange(0, COMM_BLOCK_M)
+            offs_cn = col0 + tl.arange(0, COMM_BLOCK_N)
+            c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+            tile_offsets = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
+
+            final_acc = tl.zeros((COMM_BLOCK_M, COMM_BLOCK_N), dtype=tl.float32)
+            for i in tl.static_range(WORLD_SIZE):
+                target_rank = (i + rank) % WORLD_SIZE
+                remote_c_ptr = dl.symm_at(c_ptr, target_rank)
+                token = dl.wait(tile_signal_ptr + signal_base + target_rank, 1, "sys", "acquire", waitValue=1)
+                remote_c_ptr = dl.consume_token(remote_c_ptr, token)
+                final_acc += tl.load(remote_c_ptr + tile_offsets, mask=c_mask, other=0.0)
+
+            out = final_acc.to(c_ptr.dtype.element_ty)
+            tl.store(c_ptr + tile_offsets, out, mask=c_mask, cache_modifier=".wt")
+            for i in tl.static_range(WORLD_SIZE):
+                target_rank = (i + rank + 1) % WORLD_SIZE
+                if target_rank != rank:
+                    remote_buf_ptr = dl.symm_at(c_ptr, target_rank)
+                    tl.store(remote_buf_ptr + tile_offsets, out, mask=c_mask)
+
+
 DEFAULT_GEMM_CONFIG = triton.Config(
     kwargs={"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 4, "waves_per_eu": 2},
     num_warps=8, num_stages=2)
@@ -303,7 +432,12 @@ def prune_fn_by_shared_memory(config, ctx: GemmARContext, A: torch.Tensor, *args
     key_fn=key_fn,
     prune_fn=prune_fn_by_shared_memory,
 )
-def gemm_allreduce_op(ctx: GemmARContext, A: torch.Tensor, B: torch.Tensor, gemm_config: triton.Config):
+def gemm_allreduce_op(ctx: GemmARContext, A: torch.Tensor, B: torch.Tensor, gemm_config: triton.Config,
+                      fused: bool = False, comm_block_m: int = 256, comm_block_n: int = 128):
+    # ``fused=True`` selects the fully-fused single-kernel GEMM + two-shot
+    # all-reduce; the default (False) keeps the legacy two-kernel path unchanged.
+    # ``comm_block_m/n`` size the fused reduction's comm tiles (clamped to the
+    # GEMM block below).
     NUM_COMM_SMS = 32
     assert A.shape[1] == B.shape[1], "Incompatible dimensions"
     assert A.dtype == B.dtype, "Incompatible dtypes"
@@ -322,6 +456,21 @@ def gemm_allreduce_op(ctx: GemmARContext, A: torch.Tensor, B: torch.Tensor, gemm
     BLOCK_SIZE_M = gemm_config.kwargs["BLOCK_SIZE_M"]
     BLOCK_SIZE_N = gemm_config.kwargs["BLOCK_SIZE_N"]
     GROUP_SIZE_M = gemm_config.kwargs["GROUP_SIZE_M"]
+
+    if fused:
+        # Fully fused, two-shot: all CUs do GEMM (phase 1) then a decoupled
+        # small-tile reduce+broadcast (phase 2), result written in place.
+        COMM_BLOCK_M = min(comm_block_m, BLOCK_SIZE_M)
+        COMM_BLOCK_N = min(comm_block_n, BLOCK_SIZE_N)
+        gemm_allreduce_fused_twoshot_kernel[(num_sms, )](A, B, symm_c, tile_signal, M, N, K, A.stride(0), A.stride(1),
+                                                         B.stride(0), B.stride(1), symm_c.stride(0), symm_c.stride(1),
+                                                         COMM_BLOCK_M=COMM_BLOCK_M, COMM_BLOCK_N=COMM_BLOCK_N,
+                                                         NUM_SMS=num_sms, WORLD_SIZE=ctx.num_ranks,
+                                                         **gemm_config.all_kwargs())
+        reset_signal_and_barrier_all_kernel[(num_sms, )](ctx.rank, ctx.num_ranks, ctx.comm_buf_ptr, tile_signal,
+                                                         tile_signal.shape[0], num_warps=16)
+        return symm_c
+
     kernel_persistent_gemm_notify_ar[(NUM_GEMM_SMS, )](A, B, symm_c, tile_signal, M, N, K, A.stride(0), A.stride(1),
                                                        B.stride(0), B.stride(1), symm_c.stride(0), symm_c.stride(1),
                                                        NUM_GEMM_SMS=NUM_GEMM_SMS, **gemm_config.all_kwargs())

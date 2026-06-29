@@ -91,7 +91,7 @@ def run_stress_test(args, TP_GROUP, dtype, atol, rtol):
 
             for _ in range(10):
                 A, B = _make_data(M, N, K_per_rank, TP_GROUP)
-                output_triton = gemm_allreduce_op(ctx, A, B, autotune=False)
+                output_triton = gemm_allreduce_op(ctx, A, B, autotune=False, fused=args.fused)
                 output_torch = gemm_allreduce_torch(A, B, TP_GROUP)
                 assert_allclose(output_triton, output_torch, atol=atol, rtol=rtol, verbose=False)
             dist_print(f"✅ Round {round_idx + 1} passed")
@@ -119,6 +119,8 @@ def parse_args():
     parser.add_argument("--iters", default=20, type=int, help="perf iterations")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--profile", default=False, action="store_true", help="dump torch.profiler.profile")
+    parser.add_argument("--fused", default=False, action="store_true",
+                        help="use the fully-fused single-kernel GEMM + two-shot all-reduce")
     parser.add_argument("--stress", default=False, action="store_true", help="run stress test with random shapes")
     parser.add_argument("--stress_rounds", type=int, default=10, help="number of stress test rounds")
     return parser.parse_args()
@@ -151,7 +153,7 @@ if __name__ == "__main__":
     ctx = create_gemm_ar_context(ar_stream=ar_stream, rank=RANK, world_size=WORLD_SIZE, max_M=M, N=N, dtype=dtype)
     a, b = _make_data(M, N, K, TP_GROUP)
     torch_output = gemm_allreduce_torch(a, b, TP_GROUP)
-    triton_output = gemm_allreduce_op(ctx, a, b)
+    triton_output = gemm_allreduce_op(ctx, a, b, fused=args.fused)
     assert_allclose(torch_output, triton_output, atol=THRESHOLD_MAP[dtype], rtol=THRESHOLD_MAP[dtype])
 
     with group_profile("gemm_ar", args.profile, group=TP_GROUP):
@@ -167,6 +169,7 @@ if __name__ == "__main__":
             ctx,
             a,
             b,
+            fused=args.fused,
         ), iters=iters, warmup_iters=warmup_iters)
 
     dist_print(f"torch #{RANK} {duration_ms_torch:0.2f} ms/iter", need_sync=True, allowed_ranks=list(range(WORLD_SIZE)))
